@@ -1,0 +1,16 @@
+# Airflow specific
+airflow.db
+airflow.cfg
+logs/
+unittests.cfg
+webserver_config.py
+
+# Python specific
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+.env
+.venv/
