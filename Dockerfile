@@ -10,5 +10,10 @@ RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r /requirements.txt
 # RUN pip install --no-cache-dir --user -r /requirements.txt
 
+# RUN sudo apt install unixodbc-dev
+
+RUN pip install apache-airflow-providers-odbc
+
 # Install the MSSQL provider
 RUN pip install apache-airflow-providers-microsoft-mssql
+
