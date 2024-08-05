@@ -24,8 +24,8 @@ table_columns = {
         'rowguid', 'modified_date'
     ],
     'dim_customer_address': [
-        'customerid', 'addressid', 'addresstype',
-        'rowguid', 'modifieddate'
+        'customer_address_id', 'customer_id', 'address_id', 'address_type',
+        'rowguid', 'modified_date'
     ],
     'dim_region': [
         #'start_lsn', 'end_lsn', 'seqval', 'operation', 'command_id',
@@ -33,9 +33,9 @@ table_columns = {
     ],
     'fact_sales_order_detail': [
         #'start_lsn', 'end_lsn', 'seqval', 'operation', 'command_id',
-        'salesorderid', 'salesorderdetailid', 'orderqty',
-        'productid', 'unitprice', 'unitpricediscount', 
-        'linetotal', 'rowguid', 'modifieddate'
+        'sales_order_detail_id', 'sales_order_id', 'order_qty',
+        'product_id', 'unit_price', 'unit_price_discount', 
+        'line_total', 'rowguid', 'modified_date'
     ],
     'fact_sales_order_header': [
         'sales_order_id', 'revision_number', 'order_date', 
@@ -57,7 +57,7 @@ def get_max_lsn_from_postgres(table, **kwargs):
         'host': 'postgresqlserver-seles-demo-001.postgres.database.azure.com'
     }
     
-    query = f"SELECT max(start_lsn) FROM stage.{table}"
+    query = f"select last_update from metadata.update_metadata where table_name = '{table}'"
     
     with psycopg2.connect(**conn_params) as conn:
         with conn.cursor() as cursor:
@@ -101,15 +101,17 @@ def extract_from_mssql(table, **kwargs):
             from
                 cdc.SalesLT_{table}_CT tb 
             )
-            select * from cte where [__$start_lsn] > '{date_param}'
+            select * from cte where [__$start_lsn] > '{date_param}' and [__$operation] <> 3
             """
+    print(query)
     
     with pyodbc.connect(conn_str) as conn:
         with conn.cursor() as cursor:
             cursor.execute(query)
             rows = cursor.fetchall()
             rows_list = [list(row) for row in rows]
-    
+   
+    print(rows_list)
     return rows_list
 
 def load_to_postgres(table, **kwargs):
@@ -125,17 +127,156 @@ def load_to_postgres(table, **kwargs):
     columns = table_columns.get(table, [])
     column_str = ', '.join(columns)
     value_str = ', '.join(['%s'] * (len(columns)+5))
+
+    truncate_query = f'TRUNCATE stage.{table}'
+
+    with psycopg2.connect(**conn_params) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(truncate_query)
+            conn.commit()
     
     insert_query = f'''
     INSERT INTO stage.{table} (
         start_lsn, end_lsn, seqval, operation, command_id, {column_str}
     ) VALUES ({value_str})
     '''
+    print(f'ROWS {rows}')
+
+    with psycopg2.connect(**conn_params) as conn:
+        with conn.cursor() as cursor:
+            cursor.executemany(insert_query, rows)
+            conn.commit()
+
+
+def process_in_postgres(table, **kwargs):
+    # rows = kwargs['ti'].xcom_pull(task_ids=f'extract_from_mssql_{table}')
+    
+    conn_params = {
+        'dbname': 'postgres',
+        'user': 'admin_login',
+        'password': '25892589aA',
+        'host': 'postgresqlserver-seles-demo-001.postgres.database.azure.com'
+    }
+    
+    columns = table_columns.get(table, [])
+    column_str = ', '.join(columns)
+    update_column_str = ', '.join([f'{column} = EXCLUDED.{column}' for column in columns[1:]])
+    # value_str = ', '.join(['%s'] * (len(columns)+5))
+    
+    if table == 'dim_region':
+        process_query = f'''
+                    -- BEGIN;
+
+                    -- UPSERT
+                    INSERT INTO target.{table} 
+                        ({column_str})
+                    SELECT 
+                        {column_str}
+                    FROM 
+                        stage.{table}
+                    WHERE 
+                        operation IN (2, 4)
+                    ORDER BY seqval;
+
+                    -- SOFT DELETE
+                    UPDATE target.{table} t
+                    SET is_deleted = TRUE
+                    FROM stage.{table} s
+                    WHERE s.{columns[0]} = t.{columns[0]}
+                    AND s.operation = 1;
+
+                    -- SAVE LAST UPDATE DATE
+                    DO $$
+                    BEGIN
+                        IF (select count(*) from stage.{table}) > 0 THEN
+                            INSERT INTO metadata.update_metadata (table_name, last_update)
+                            SELECT 
+                                '{table}', 
+                                MAX(start_lsn) AS last_update 
+                            FROM 
+                                stage.{table}
+                            ON CONFLICT (table_name)
+                            DO UPDATE SET
+                                last_update = EXCLUDED.last_update;
+                        END IF;
+                    END $$;
+
+                    -- SCD
+                    UPDATE target.dim_region
+                    SET is_current = false
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM stage.dim_region dr
+                        WHERE dr.region_id = target.dim_region.region_id
+                    );
+
+                    WITH max_datetime AS (
+                        SELECT region_id, MAX(modified_date) AS max_modified_date
+                        FROM stage.dim_region
+                        GROUP BY region_id
+                    )
+                    UPDATE target.dim_region dr
+                    SET is_current = true
+                    FROM max_datetime md
+                    WHERE dr.region_id = md.region_id
+                    AND dr.modified_date = md.max_modified_date;
+
+                    -- COMMIT;
+                    '''
+    else:
+        process_query = f'''
+                    -- BEGIN;
+
+                    -- UPSERT
+                    INSERT INTO target.{table} 
+                        ({column_str})
+                    SELECT 
+                        {column_str}
+                    FROM 
+                        (
+                            SELECT 
+                                *,
+                                ROW_NUMBER() OVER (PARTITION BY {columns[0]} ORDER BY seqval DESC) AS row_number
+                            FROM 
+                                stage.{table}
+                            WHERE 
+                                operation IN (2, 4)
+                        ) nq
+                    WHERE 
+                        row_number = 1
+                    ON CONFLICT ({columns[0]})
+                    DO UPDATE SET 
+                        {update_column_str};
+
+                    -- SOFT DELETE
+                    UPDATE target.{table} t
+                    SET is_deleted = TRUE
+                    FROM stage.{table} s
+                    WHERE s.{columns[0]} = t.{columns[0]}
+                    AND s.operation = 1;
+
+                    -- SAVE LAST UPDATE DATE
+                    DO $$
+                    BEGIN
+                        IF (select count(*) from stage.{table}) > 0 THEN
+                            INSERT INTO metadata.update_metadata (table_name, last_update)
+                            SELECT 
+                                '{table}', 
+                                MAX(start_lsn) AS last_update 
+                            FROM 
+                                stage.{table}
+                            ON CONFLICT (table_name)
+                            DO UPDATE SET
+                                last_update = EXCLUDED.last_update;
+                        END IF;
+                    END $$;
+                    -- COMMIT;
+                    '''
+    print(process_query)
     
     with psycopg2.connect(**conn_params) as conn:
         with conn.cursor() as cursor:
-            for row in rows:
-                cursor.execute(insert_query, row)
+            cursor.execute(process_query)
             conn.commit()
 
 with DAG(
@@ -171,5 +312,12 @@ with DAG(
             op_kwargs={'table': table},
             provide_context=True,
         )
+
+        process_task = PythonOperator(
+            task_id=f'process_in_postgres_{table}',
+            python_callable=process_in_postgres,
+            op_kwargs={'table': table},
+            provide_context=True,
+        )
         
-        get_max_lsn_task >> extract_task >> load_task
+        get_max_lsn_task >> extract_task >> load_task >> process_task
